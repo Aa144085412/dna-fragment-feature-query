@@ -1,6 +1,8 @@
 import importlib.util
 import struct
 import tempfile
+import hashlib
+import xml.etree.ElementTree as ET
 import unittest
 from pathlib import Path
 import zipfile
@@ -66,6 +68,68 @@ class Core(unittest.TestCase):
             self.assertEqual({x.name for x in (Path(d)/'out').iterdir()},
                              {'review.xlsx','review.tsv','report.md','result.json'})
             self.assertIn('一般可暂不修复',(Path(d)/'out'/'report.md').read_text(encoding='utf-8'))
+
+    def test_vendor_copy_last_step_preserves_original_and_never_overwrites(self):
+        # Entirely synthetic vendor Excel, including a second worksheet to preserve.
+        sheet = ('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                 '<dimension ref="A1:G2"/><sheetData><row r="1">'
+                 '<c r="B1" t="inlineStr"><is><t>4K分段</t></is></c>'
+                 '</row><row r="2">'
+                 '<c r="B2" t="inlineStr"><is><t>Project-1-1</t></is></c>'
+                 '<c r="E2" t="inlineStr"><is><t>1-A-G；2-C-T；3-G-A</t></is></c>'
+                 '<c r="F2" t="inlineStr"><is><t>原结论</t></is></c>'
+                 '</row></sheetData></worksheet>')
+        other = b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>'
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'vendor.xlsx'
+            with zipfile.ZipFile(source,'w') as z:
+                z.writestr('xl/worksheets/sheet1.xml',sheet)
+                z.writestr('xl/worksheets/sheet2.xml',other)
+            before = hashlib.sha256(source.read_bytes()).hexdigest()
+            records = [
+                dict(fragment='1-1',annotation='1-A-G',mutation='1-A-G',
+                     decision='优先评估修复',reason='candidate',mapping='MAPPED',
+                     evidence='UCSC_API_VERIFIED',chrom='chr17',hg38_pos=101,
+                     ccre_hits=[{'name':'EH-test'}],gene_hits=[],repeat_hits=[]),
+                dict(fragment='1-1',annotation='2-C-T',mutation='2-C-T',
+                     decision='一般可暂不修复',reason='no annotation',mapping='MAPPED',
+                     evidence='UCSC_API_VERIFIED',chrom='chr17',hg38_pos=102,
+                     ccre_hits=[],gene_hits=[],repeat_hits=[]),
+            ]
+            output = dfq.export_annotated_vendor_copy(source,Path(d),records)
+            self.assertNotEqual(source,output)
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
+            with zipfile.ZipFile(output) as z:
+                self.assertEqual(z.read('xl/worksheets/sheet2.xml'),other)
+                ns={'m':'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+                root=ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
+                cells={c.get('r'):''.join(c.itertext()) for c in root.findall('.//m:c',ns)}
+                self.assertEqual(cells['E2'],'1-A-G；2-C-T；3-G-A')
+                self.assertEqual(cells['F2'],'1修复；2不修复；3待核实')
+                self.assertIn('候选调控元件EH-test',cells['G2'])
+                self.assertIn('未找到对应的SnapGene',cells['G2'])
+            first_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+            second=dfq.export_annotated_vendor_copy(source,Path(d),records)
+            self.assertNotEqual(output,second)
+            self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(),first_hash)
+
+    def test_final_calls_repair_nonsynonymous_and_withhold_uncertain(self):
+        base=dict(fragment='1-2',annotation='2-C-T',mutation='2-C-T',mapping='MAPPED',
+                  chrom='chrTest',hg38_pos=123456,evidence='UCSC_API_VERIFIED',
+                  gene_hits=[],ccre_hits=[],repeat_hits=[],
+                  decision='建议修复',reason='coding')
+        altered=dict(base,coding={'gene':'GENE_TEST','effect':'nonsynonymous',
+                                  'transcript':'NM_TEST.1','aa':'A12V'})
+        self.assertEqual(dfq.final_repair_call(altered)[0],'修复')
+        self.assertIn('A12V',dfq.final_repair_call(altered)[1])
+        unclear=dict(base,decision='核对原始注释',reason='BC1不等于报告1-A-T')
+        self.assertEqual(dfq.final_repair_call(unclear)[0],'待核实')
+        offline=dict(base,decision='证据不足',reason='UCSC未核验')
+        self.assertEqual(dfq.final_repair_call(offline)[0],'待核实')
+        repeat=dict(base,annotation='1-C-CACAC',mutation='1-C-CACAC',reported_ref='C',reported_alt='CACAC',
+                    decision='条件修复',coding=None,repeat_hits=[{'repName':'(AC)n','repClass':'Simple_repeat'}])
+        self.assertEqual(dfq.final_repair_call(repeat)[0],'不修复')
+        self.assertIn('实验变量',dfq.final_repair_call(repeat)[1])
     def test_xlsx_opens_as_valid_package(self):
         with tempfile.TemporaryDirectory() as d:
             x=Path(d)/'result.xlsx'

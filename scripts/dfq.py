@@ -289,6 +289,150 @@ def export_xlsx(path,records):
         z.writestr('xl/_rels/workbook.xml.rels','<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
         z.writestr('xl/worksheets/sheet1.xml',xml)
 
+
+def final_repair_call(r):
+    """Binary vendor recommendation after the existing scientific review gates.
+
+    Unresolved evidence is never silently converted into 'do not repair'.
+    """
+    prior, note = r['decision'], r['reason']
+    position = f"{r['chrom']}:{r['hg38_pos']:,}" if r.get('chrom') and r.get('hg38_pos') else 'hg38坐标未确认'
+    prefix = position + '，'
+    if prior in ('暂不判定', '核对原始注释', '证据不足'):
+        return '待核实', prefix + note
+    effect = r.get('coding') or {}
+    if effect.get('effect') == 'nonsynonymous':
+        return '修复', prefix + f"{effect.get('gene','')}编码区，按{effect['transcript']}预测为{effect['aa']}非同义替换；建议恢复设计序列（预测不等于功能验证）"
+    ccre = r.get('ccre_hits') or []
+    if ccre:
+        ids = ', '.join(x.get('name','未知') for x in ccre)
+        return '修复', prefix + f'重叠ENCODE4候选调控元件{ids}；为保留潜在调控序列建议修复，但尚未证实该突变改变功能'
+    repeats = r.get('repeat_hits') or []
+    rep = ', '.join(dict.fromkeys(x.get('repName','?') for x in repeats))
+    is_indel = ('缺失' in r['mutation'] or
+                bool(r.get('reported_ref')) and len(r['reported_ref']) != len(r.get('reported_alt','')))
+    if is_indel:
+        if repeats and all(x.get('repClass') in ('SINE', 'Simple_repeat') for x in repeats):
+            return '不修复', prefix + f'位于{rep}重复序列，改变局部重复长度；未查询到编码损害或cCRE重叠。仅在重复长度不是实验变量时可不修复，原始测序及indel归一化仍需核对'
+        return '待核实', prefix + '插入/缺失会改变序列长度，当前证据无法排除结构或功能影响；先核对测序及实验设计'
+    if effect.get('effect') == 'synonymous':
+        return '不修复', prefix + f"{effect.get('gene','')}编码区预测为同义替换；未见蛋白氨基酸改变，但不能排除RNA或调控影响"
+    pos0 = r['hg38_pos'] - 1
+    in_exon, coding_exon, genes = False, False, set()
+    for g in r.get('gene_hits') or []:
+        genes.add(g.get('name2') or g.get('name') or '未知基因')
+        starts, ends = g.get('exonStarts', []), g.get('exonEnds', [])
+        if isinstance(starts, str):starts = [int(x) for x in starts.strip(',').split(',') if x]
+        if isinstance(ends, str):ends = [int(x) for x in ends.strip(',').split(',') if x]
+        if any(a <= pos0 < b for a,b in zip(starts, ends)):
+            in_exon = True
+            if int(g.get('cdsStart', 0)) <= pos0 < int(g.get('cdsEnd', 0)):
+                coding_exon = True
+    if coding_exon:
+        return '待核实', prefix + '位于蛋白编码外显子，但缺少可靠的密码子影响解释；不得直接判为无功能'
+    if in_exon:
+        return '不修复', prefix + f"位于{', '.join(sorted(genes))}非编码外显子；未见蛋白编码改变或已查询cCRE重叠。RNA功能影响尚未排除，若研究RNA通路需重新评估"
+    if repeats:
+        location = f'位于{rep}重复元件内'
+    elif genes:
+        location = f"位于{', '.join(sorted(genes))}转录区域的非外显子部分"
+    else:
+        location = '未发现已查询RefSeq转录本或RepeatMasker重叠'
+    return '不修复', prefix + location + '；未见已查询编码外显子或ENCODE4 cCRE重叠，暂无明确损害证据（不能证明没有功能）'
+
+
+def export_annotated_vendor_copy(source, output_dir, rows):
+    """Last step: produce a fresh XLSX with original sheet/layout plus F/G review.
+
+    Leave the input untouched. Preserve all other zip members and worksheets;
+    refuse to overwrite even an earlier generated result.
+    """
+    source, output_dir = Path(source), Path(output_dir)
+    outcome = output_dir / (source.stem + '_hg38修复说明.xlsx')
+    number = 2
+    while outcome.exists() or outcome.resolve() == source.resolve():
+        outcome = output_dir / (source.stem + f'_hg38修复说明_{number}.xlsx')
+        number += 1
+    lookup = {}
+    for r in rows:
+        m = ORD.match(r['annotation'])
+        index = 1 if r['annotation'] == 'BC1' else int(m[1])
+        key = (r['fragment'], index)
+        if key in lookup:raise ValueError(f'Duplicate annotated mutation: {key}')
+        lookup[key] = r
+    with zipfile.ZipFile(source) as original:
+        names = original.namelist()
+        worksheets = sorted(x for x in names if re.fullmatch(r'xl/worksheets/sheet\d+\.xml',x))
+        if not worksheets:raise ValueError('XLSX contains no worksheet')
+        target = worksheets[0]
+        strings = []
+        if 'xl/sharedStrings.xml' in names:
+            strings = [''.join(n.itertext()) for n in ET.fromstring(original.read('xl/sharedStrings.xml')).findall('m:si',XNS)]
+        doc = ET.fromstring(original.read(target))
+        body = doc.find('m:sheetData',XNS)
+        if body is None:raise ValueError('XLSX has no sheetData')
+        def read_cell(row, column):
+            cell = next((c for c in row.findall('m:c',XNS) if re.match('[A-Z]+',c.get('r','')).group() == column),None)
+            if cell is None:return ''
+            value = cell.find('m:v',XNS)
+            inline = cell.find('m:is',XNS)
+            raw = value.text if value is not None else ''.join(inline.itertext()) if inline is not None else ''
+            return strings[int(raw)] if cell.get('t') == 's' and raw else (raw or '')
+        def put(row, column, value):
+            address = column + row.get('r')
+            cell = next((c for c in row.findall('m:c',XNS) if c.get('r') == address), None)
+            if cell is None:
+                cell = ET.Element('{' + XNS['m'] + '}c', {'r':address})
+                siblings = list(row)
+                order = lambda x: sum((ord(c)-64)*26**i for i,c in enumerate(re.match('[A-Z]+',x.get('r','A')).group()[::-1]))
+                spot = next((i for i,x in enumerate(siblings) if x.tag.endswith('}c') and order(x)>order(cell)),len(siblings))
+                row.insert(spot,cell)
+            for child in list(cell):cell.remove(child)
+            cell.set('t','inlineStr')
+            if value.startswith(('=','+','-','@')):value="'"+value
+            ET.SubElement(ET.SubElement(cell,'{'+XNS['m']+'}is'),'{'+XNS['m']+'}t').text=value
+        updated = 0
+        for excel_row in body.findall('m:row', XNS):
+            number = int(excel_row.get('r','0'))
+            if number == 1:
+                put(excel_row,'F','修复结论')
+                put(excel_row,'G','每处突变的修复／不修复原因（hg38）')
+                continue
+            fragment = fragment_id(read_cell(excel_row,'B'))
+            if not fragment:continue
+            claims = [v.strip() for v in re.split('[;；]',read_cell(excel_row,'E')) if v.strip()]
+            decisions, explanations = [], []
+            for claim in claims:
+                m = ORD.match(claim)
+                if not m:continue
+                index = int(m[1]); key=(fragment,index)
+                record = lookup.get(key)
+                if record is None:
+                    call,reason='待核实','未找到对应的SnapGene突变注释，不能判断是否影响功能'
+                else:
+                    call,reason=final_repair_call(record)
+                decisions.append(f'{index}{call}')
+                explanations.append(f'{claim}｜{call}：{reason}')
+            if not decisions:continue
+            put(excel_row,'F','；'.join(decisions))
+            put(excel_row,'G','\n'.join(explanations))
+            updated += 1
+        if not updated:raise ValueError('No vendor Excel rows could be matched; review not exported')
+        dimension=doc.find('m:dimension',XNS)
+        if dimension is not None:
+            ref=dimension.get('ref','')
+            if ':' in ref:
+                beginning,end=ref.split(':',1)
+                m=re.match(r'[A-Z]+(\d+)',end)
+                if m and end[0] < 'G':dimension.set('ref',beginning+':G'+m[1])
+        ET.register_namespace('',XNS['m'])
+        ET.register_namespace('r','http://schemas.openxmlformats.org/officeDocument/2006/relationships')
+        edited=ET.tostring(doc,encoding='utf-8',xml_declaration=True)
+        with zipfile.ZipFile(outcome,'x') as dest:
+            for info in original.infolist():
+                dest.writestr(info,edited if info.filename == target else original.read(info.filename))
+    return outcome
+
 def main(argv=None):
     ap=argparse.ArgumentParser(description='DNA Fragment Feature Query hg38 review')
     ap.add_argument('--input',required=True,help='Directory of mutation-annotated SnapGene .dna files')
@@ -347,7 +491,9 @@ def main(argv=None):
         md.append('|'+ '|'.join(str(v).replace('|','/')[:120] for v in values)+'|')
     md+=['','## 数据来源','', '本地 NCBI BLAST+ hg38 索引，UCSC /getData/sequence /getData/track。详见 result.json。']
     (out/'report.md').write_text('\n'.join(md)+'\n',encoding='utf-8')
+    vendor_copy = export_annotated_vendor_copy(Path(args.xlsx),out,rows) if args.xlsx else None
     print(json.dumps({'files':len(paths),'variants':len(rows),'decisions':counter,'output':str(out.resolve()),
+                       'vendor_review_copy':str(vendor_copy) if vendor_copy else None,
                        'online':args.online},ensure_ascii=False))
     return 0
 
