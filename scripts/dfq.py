@@ -30,7 +30,7 @@ COLS = [('fragment','片段'),('mutation','报告突变'),('position','SnapGene�
  ('mapping','BLAST定位状态'),('identity','比对一致性%'),('ref_base','hg38参考碱基'),
  ('reported_ref','报告REF'),('reported_alt','报告ALT'),('repeat','RepeatMasker'),
  ('ccre','ENCODE4 cCRE'),('genes','RefSeq基因'),('coding_effect','编码影响预测'),
- ('decision','修复建议'),('reason','判定依据'),('evidence','证据状态'),('ucsc','UCSC链接')]
+ ('decision','修复建议'),('reason','判定依据'),('evidence','证据状态'),('ucsc','UCSC链接'),('cpg_effect','CpG变化(hg38)')]
 
 def fragment_id(value):
     """Extract the final two numeric fragment segments, independent of order prefix.
@@ -183,7 +183,18 @@ def get_annotations(rows,online=False):
             r['evidence']='LOCAL_MAPPING_ONLY; UCSC annotations not queried';continue
         chrom,pos=r['chrom'],r['hg38_pos']-1
         errors=[]
-        try:r['ref_base']=api('getData/sequence',genome='hg38',chrom=chrom,start=pos,end=pos+1).get('dna','').upper()
+        m=AL.fullmatch(r.get('mutation',''))
+        is_snv=bool(m and len(m[2])==len(m[3])==1)
+        # Reuse the existing UCSC request; SNVs need both flanking bases for CpG.
+        start,end=(pos-1,pos+2) if is_snv and pos>0 else (pos,pos+1)
+        try:
+            dna=api('getData/sequence',genome='hg38',chrom=chrom,start=start,end=end).get('dna','').upper()
+            r['ref_base']=dna[1:2] if is_snv and pos>0 else dna
+            if is_snv:
+                if pos>0 and len(dna)==3 and set(dna)<=DNA:
+                    r['ref_context']=dna
+                else:
+                    errors.append('cpg_reference_flanks_not_verified')
         except Exception as e:errors.append('ref:'+str(e)[:120])
         for track,key in [('rmsk','repeat_hits'),('cCREregistry','ccre_hits'),('ncbiRefSeq','gene_hits')]:
             try:r[key]=api('getData/track',genome='hg38',track=track,chrom=chrom,start=pos,end=pos+1).get(track,[])
@@ -237,6 +248,37 @@ def coding_effect(r,fetch=api):
                     aa=aa,effect='synonymous' if CODE[ref_codon]==CODE[alt_codon] else 'nonsynonymous')
     return None
 
+def cpg_change(r):
+    """CpG gain/loss at a reported SNP, using hg38 positive-strand triplet.
+
+    A feature label describes the reported change, not a confirmed mutant allele.
+    Missing context, ambiguous labels and indels are not zero-change calls.
+    """
+    m=AL.fullmatch(r.get('mutation',''))
+    if not m or len(m[2])!=1 or len(m[3])!=1 or r.get('annotation_warning'):
+        return None
+    context=r.get('ref_context','')
+    if len(context)!=3 or set(context)-set('ACGT'):
+        return None
+    ref=m[2].translate(COMP) if r.get('strand')=='-' else m[2]
+    alt=m[3].translate(COMP) if r.get('strand')=='-' else m[3]
+    if context[1]!=ref or r.get('ref_base')!=ref:
+        return None
+    changed=context[0]+alt+context[2]
+    delta=changed.count('CG')-context.count('CG')
+    return dict(delta=delta,effect='gain' if delta>0 else 'loss' if delta<0 else 'unchanged',
+                reference_context=context,alternate_context=changed,
+                reference_cpg=context.count('CG'),alternate_cpg=changed.count('CG'))
+
+
+def cpg_reason(cpg):
+    if cpg['delta']>0:
+        return f"hg38正链{cpg['reference_context']}→{cpg['alternate_context']}新增1个CpG（潜在5mC底物）"
+    if cpg['delta']<0:
+        return f"hg38正链{cpg['reference_context']}→{cpg['alternate_context']}丢失1个CpG（潜在5mC底物减少）"
+    return '未改变CpG'
+
+
 def decide(r):
     if r.get('mapping') not in ('MAPPED','MAPPED_WITH_ALT_CONTIG'):
         return '暂不判定','未可靠定位或全基因组多重命中'
@@ -254,6 +296,13 @@ def decide(r):
         return '建议修复',f"编码非同义变化预测 {effect['transcript']}: {effect['aa']}"
     if r.get('ccre_hits'):
         return '优先评估修复','与ENCODE4候选cCRE重叠；功能未被此查询证明'
+    m=AL.fullmatch(r.get('mutation',''))
+    if m and len(m[2])==len(m[3])==1:
+        cpg=r.get('cpg')
+        if cpg is None:
+            return '证据不足','CpG增减所需的hg38三碱基上下文或突变等位基因未核实'
+        if cpg['delta']:
+            return '优先评估修复',cpg_reason(cpg)+'；为避免5mC实验混杂建议修复，单点功能影响尚未验证'
     if '缺失' in r['mutation'] or (r.get('reported_ref') and len(r['reported_ref'])!=len(r.get('reported_alt',''))):
         return '条件修复','插入/缺失改变片段长度，重复区域需归一化并核对测序峰图'
     if effect and effect['effect']=='synonymous':
@@ -281,7 +330,7 @@ def export_xlsx(path,records):
             if v.startswith(('=','+','-','@')):v="'"+v
             cells.append(f'<c r="{column(j)}{i}" t="inlineStr"><is><t>{escape(v)}</t></is></c>')
         data.append(f'<row r="{i}">'+''.join(cells)+'</row>')
-    xml='<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" state="frozen" topLeftCell="A2" activePane="bottomLeft"/></sheetView></sheetViews><sheetData>'+''.join(data)+'</sheetData><autoFilter ref="A1:S'+str(len(rows))+'"/></worksheet>'
+    xml='<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" state="frozen" topLeftCell="A2" activePane="bottomLeft"/></sheetView></sheetViews><sheetData>'+''.join(data)+'</sheetData><autoFilter ref="A1:T'+str(len(rows))+'"/></worksheet>'
     with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as z:
         z.writestr('[Content_Types].xml','<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
         z.writestr('_rels/.rels','<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
@@ -301,12 +350,20 @@ def final_repair_call(r):
     if prior in ('暂不判定', '核对原始注释', '证据不足'):
         return '待核实', prefix + note
     effect = r.get('coding') or {}
+    cpg = r.get('cpg')
+    extra = '；同时' + cpg_reason(cpg) if cpg and cpg['delta'] else ''
     if effect.get('effect') == 'nonsynonymous':
-        return '修复', prefix + f"{effect.get('gene','')}编码区，按{effect['transcript']}预测为{effect['aa']}非同义替换；建议恢复设计序列（预测不等于功能验证）"
+        return '修复', prefix + f"{effect.get('gene','')}编码区，按{effect['transcript']}预测为{effect['aa']}非同义替换；建议恢复设计序列（预测不等于功能验证）" + extra
     ccre = r.get('ccre_hits') or []
     if ccre:
         ids = ', '.join(x.get('name','未知') for x in ccre)
-        return '修复', prefix + f'重叠ENCODE4候选调控元件{ids}；为保留潜在调控序列建议修复，但尚未证实该突变改变功能'
+        return '修复', prefix + f'重叠ENCODE4候选调控元件{ids}；为保留潜在调控序列建议修复，但尚未证实该突变改变功能' + extra
+    m=AL.fullmatch(r.get('mutation',''))
+    if m and len(m[2])==len(m[3])==1:
+        if cpg is None:
+            return '待核实', prefix + 'CpG新增／丢失检查缺少可靠的hg38三碱基上下文，不能判为不修复'
+        if cpg['delta']:
+            return '修复', prefix + cpg_reason(cpg) + '；为避免影响5mC及染色质实验比较，建议恢复设计序列（尚无单点功能损害证据）'
     repeats = r.get('repeat_hits') or []
     rep = ', '.join(dict.fromkeys(x.get('repName','?') for x in repeats))
     is_indel = ('缺失' in r['mutation'] or
@@ -464,6 +521,16 @@ def main(argv=None):
         if r.get('evidence')=='UCSC_API_VERIFIED' and r.get('gene_hits'):
             try:r['coding']=coding_effect(r)
             except Exception as exc:r['coding_error']=str(exc)
+        r['cpg']=cpg_change(r) if r.get('evidence')=='UCSC_API_VERIFIED' else None
+        m=AL.fullmatch(r.get('mutation',''))
+        if m and len(m[2])==len(m[3])==1:
+            cpg=r['cpg']
+            r['cpg_effect']=(
+                ('新增CpG' if cpg['delta']>0 else '丢失CpG' if cpg['delta']<0 else '不改变CpG')
+                + f"（{cpg['reference_context']}→{cpg['alternate_context']}）"
+                if cpg else '待核实')
+        else:
+            r['cpg_effect']='未评估（非已确认的SNP）'
         r['decision'],r['reason']=decide(r)
         r['repeat']=', '.join(x.get('repName','?')+' ('+x.get('repClass','?')+')' for x in r.get('repeat_hits') or [])
         r['ccre']=', '.join(x.get('name','?')+' ('+x.get('cCRE_class','?')+')' for x in r.get('ccre_hits') or [])
@@ -484,10 +551,10 @@ def main(argv=None):
         '- 不把cCRE当成已证实功能，也不把无注释当成无功能。',
         f'- Excel 中有 {len(unmatched)} 条未匹配的突变报告，请在 result.json 查看。','',
         '## 结论汇总','']+[f'- {k}: {v}' for k,v in counter.items()]+[
-        '', '## 逐条结果','', '|片段|标签|坐标|重复|cCRE|编码影响|建议|','|---|---|---|---|---|---|---|']
+        '', '## 逐条结果','', '|片段|标签|坐标|重复|cCRE|编码影响|CpG变化|建议|','|---|---|---|---|---|---|---|---|']
     for r in rows:
         values=[r['fragment'],r['mutation'],f"{r.get('chrom','?')}:{r.get('hg38_pos','?')}",
-                r['repeat'],r['ccre'],r['coding_effect'],r['decision']]
+                r['repeat'],r['ccre'],r['coding_effect'],r['cpg_effect'],r['decision']]
         md.append('|'+ '|'.join(str(v).replace('|','/')[:120] for v in values)+'|')
     md+=['','## 数据来源','', '本地 NCBI BLAST+ hg38 索引，UCSC /getData/sequence /getData/track。详见 result.json。']
     (out/'report.md').write_text('\n'.join(md)+'\n',encoding='utf-8')

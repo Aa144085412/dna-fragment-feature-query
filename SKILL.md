@@ -36,6 +36,7 @@ python scripts/dfq.py --input INPUT_FOLDER --xlsx VENDOR.xlsx \
 3. Output coordinates **1-based**; UCSC API intervals are **0-based half-open**.
 4. Query hg38 reference nucleotide and UCSC **rmsk / ENCODE4 cCRE registry / RefSeq** with explicit success/failure for each site.
 5. A gene-body overlap does not prove an exon/coding change. Apply CDS/exon/strand and transcript-specific codon calculations for predicted coding substitutions.
+5a. Check CpG gain/loss for reported SNVs with hg38 reference triplet and genomic positive-strand alleles. Missing flanks, mismatched REF or disputed variant labels stay uncertain; a CpG gain/loss does not prove an actual methylation or H3K9me3 change.
 6. Repeat indels require trace review and normalization; cCRE is candidate evidence not proven enhancer function. Missing tracks, mapping uncertainty or reference-allele conflict must remain unresolved.
 7. Never alter user DNA files; never push user sample data, confidential Excel, genome index, credentials or local result files to GitHub.
 
