@@ -41,6 +41,6 @@ python scripts/dfq.py --input INPUT_FOLDER --xlsx VENDOR.xlsx \
 
 ## Deliverables
 
-`report.md`, `review.xlsx`, `review.tsv`, `result.json` with per-site BLAST alternatives, coordinates, annotations, confidence/uncertainty, exact reason and UCSC links.
+`report.md`, `review.xlsx`, `review.tsv`, `result.json` with per-site BLAST alternatives, coordinates, annotations, confidence/uncertainty, exact reason and UCSC links. If `--xlsx` was supplied, **after** these reports, generate `<original-name>_hg38修复说明.xlsx`: preserve the original workbook structure and other sheets, fill F (repair / do-not-repair / verify) and G (per-site reasons), and never overwrite the input or an existing output. Uncertain evidence must remain `待核实` rather than become `不修复`.
 
 Accept completion only if input counts reconcile, all site coordinates are traceable, API status is explicit, and outputs have been validated. If inputs/data are insufficient, state the smallest missing evidence and stop rather than invent a conclusion.
