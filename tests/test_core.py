@@ -60,7 +60,7 @@ class Core(unittest.TestCase):
                                   strand='+',identity=100.0,top_hits=[{'chrom':'chr17','pos':123456}])
                 return records
             def annotate(records,*args):
-                records[0].update(evidence='UCSC_API_VERIFIED',ref_base='C',
+                records[0].update(evidence='UCSC_API_VERIFIED',ref_base='C',ref_context='ACA',
                                   repeat_hits=[],ccre_hits=[],gene_hits=[])
                 return records
             with patch.object(dfq,'map_blast',mapping),patch.object(dfq,'get_annotations',annotate):
@@ -94,7 +94,7 @@ class Core(unittest.TestCase):
                 dict(fragment='1-1',annotation='2-C-T',mutation='2-C-T',
                      decision='一般可暂不修复',reason='no annotation',mapping='MAPPED',
                      evidence='UCSC_API_VERIFIED',chrom='chr17',hg38_pos=102,
-                     ccre_hits=[],gene_hits=[],repeat_hits=[]),
+                     ccre_hits=[],gene_hits=[],repeat_hits=[],cpg={'delta':0,'reference_context':'ACA','alternate_context':'ATA'}),
             ]
             output = dfq.export_annotated_vendor_copy(source,Path(d),records)
             self.assertNotEqual(source,output)
@@ -117,7 +117,7 @@ class Core(unittest.TestCase):
         base=dict(fragment='1-2',annotation='2-C-T',mutation='2-C-T',mapping='MAPPED',
                   chrom='chrTest',hg38_pos=123456,evidence='UCSC_API_VERIFIED',
                   gene_hits=[],ccre_hits=[],repeat_hits=[],
-                  decision='建议修复',reason='coding')
+                  decision='建议修复',reason='coding',cpg={'delta':0,'reference_context':'ACA','alternate_context':'ATA'})
         altered=dict(base,coding={'gene':'GENE_TEST','effect':'nonsynonymous',
                                   'transcript':'NM_TEST.1','aa':'A12V'})
         self.assertEqual(dfq.final_repair_call(altered)[0],'修复')
@@ -130,6 +130,58 @@ class Core(unittest.TestCase):
                     decision='条件修复',coding=None,repeat_hits=[{'repName':'(AC)n','repClass':'Simple_repeat'}])
         self.assertEqual(dfq.final_repair_call(repeat)[0],'不修复')
         self.assertIn('实验变量',dfq.final_repair_call(repeat)[1])
+    def test_cpg_gain_loss_unaffected_and_minus_strand(self):
+        samples=[
+            ('1-A-G','CAA','+',1,'CGA','修复'),
+            ('1-C-T','ACG','+',-1,'ATG','修复'),
+            ('1-T-C','CAA','-',1,'CGA','修复'),
+            ('1-T-C','CTC','+',0,'CCC','不修复'),
+        ]
+        for allele,triplet,strand,delta,expected,call in samples:
+            with self.subTest(allele=allele,triplet=triplet,strand=strand):
+                r=dict(fragment='1-1',annotation=allele,mutation=allele,mapping='MAPPED',
+                       chrom='chrTest',hg38_pos=11,strand=strand,ref_base=triplet[1],
+                       ref_context=triplet,evidence='UCSC_API_VERIFIED',
+                       repeat_hits=[],ccre_hits=[],gene_hits=[])
+                r['cpg']=dfq.cpg_change(r)
+                self.assertIsNotNone(r['cpg'])
+                self.assertEqual(r['cpg']['delta'],delta)
+                self.assertEqual(r['cpg']['alternate_context'],expected)
+                r['decision'],r['reason']=dfq.decide(r)
+                self.assertEqual(dfq.final_repair_call(r)[0],call)
+                if delta:self.assertIn('CpG',dfq.final_repair_call(r)[1])
+
+    def test_cpg_reference_context_reuses_one_ucsc_sequence_request(self):
+        r=dict(fragment='1-1',annotation='1-A-G',mutation='1-A-G',mapping='MAPPED',
+               chrom='chrTest',hg38_pos=11,strand='+')
+        calls=[]
+        def fake_api(endpoint,**kwargs):
+            calls.append((endpoint,kwargs))
+            return {'dna':'CAA'} if endpoint=='getData/sequence' else {kwargs['track']:[]}
+        with patch.object(dfq,'api',fake_api):
+            dfq.get_annotations([r],online=True)
+        self.assertEqual(r['ref_base'],'A')
+        self.assertEqual(r['ref_context'],'CAA')
+        self.assertEqual(r['evidence'],'UCSC_API_VERIFIED')
+        self.assertEqual(sum(x[0]=='getData/sequence' for x in calls),1)
+        self.assertEqual([(x[1]['start'],x[1]['end']) for x in calls if x[0]=='getData/sequence'],[(9,12)])
+        self.assertEqual(dfq.cpg_change(r)['delta'],1)
+
+    def test_cpg_missing_context_never_classified_as_no_change(self):
+        r=dict(fragment='1-1',annotation='1-A-G',mutation='1-A-G',mapping='MAPPED',
+               chrom='chrTest',hg38_pos=11,strand='+',ref_base='A',
+               evidence='UCSC_API_VERIFIED',ccre_hits=[],repeat_hits=[],gene_hits=[])
+        self.assertIsNone(dfq.cpg_change(r))
+        r['cpg']=None
+        r['decision'],r['reason']=dfq.decide(r)
+        self.assertEqual(dfq.final_repair_call(r)[0],'待核实')
+        r['ref_context']='CAA'
+        r['annotation_warning']='BC1 is not mutation 1-A-G'
+        self.assertIsNone(dfq.cpg_change(r))
+        r['mutation']='1-A-AG'
+        r.pop('annotation_warning')
+        self.assertIsNone(dfq.cpg_change(r))
+
     def test_xlsx_opens_as_valid_package(self):
         with tempfile.TemporaryDirectory() as d:
             x=Path(d)/'result.xlsx'
